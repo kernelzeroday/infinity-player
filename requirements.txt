@@ -1,4 +1,4 @@
 librosa
-numpy
+numpy>2
 Pillow
 soundcard
