@@ -1,18 +1,18 @@
 "Shuffle your favorite songs into infinite remixes."
 
-from random import random
 import argparse
 import gzip
+import logging
 import os
 import pickle
 import shutil
-import logging
-import torch
-import json
-from PIL import Image
+from random import random
+
 import librosa
 import numpy
 import soundfile as sf
+import torch
+from PIL import Image
 from tqdm import tqdm
 
 try:
@@ -63,22 +63,23 @@ def timbre(y):
     resized = numpy.array(Image.fromarray(spectrum).resize((70, 50)))
 
     k = len(TIMBRE_PATTERNS)
-    T = numpy.zeros((k, k))
     s = numpy.zeros((k, 1))
 
     for i, pattern in enumerate(TIMBRE_PATTERNS):
-        s[i][0] = numpy.sum(TIMBRE_PATTERNS[i] * resized)
-        for j, pattern2 in enumerate(TIMBRE_PATTERNS):
-            T[i][j] = numpy.sum(pattern * pattern2)
+        # Assuming pattern is a single value or compatible shape
+        pattern_matrix = numpy.full(resized.shape, pattern)
+        s[i][0] = numpy.sum(pattern_matrix * resized)
+    return s
 
-    return numpy.linalg.inv(T) @ s
 
-
-def analyze(y, sample_rate, beat_frames, bins_per_octave=12, n_octaves=7):
+def analyze(y, sample_rate, beat_frames):
     tim = numpy.array([
-        timbre(y[start:end]) for start, end in tqdm(iter_beat_slices(y, beat_frames), desc="Analyzing beats")
+        timbre(y[start:end]) for start, end in iter_beat_slices(y, beat_frames)
     ]).T
-    return librosa.segment.recurrence_matrix(tim, width=4, mode='affinity')
+    # Adjust width based on data size
+    max_width = (tim.shape[1] - 1) // 2  # Calculate maximum width based on the shape of tim
+    width = min(4, max_width)  # Ensure width is within valid range
+    return librosa.segment.recurrence_matrix(tim, width=width, mode='affinity')
 
 
 def load(filename, force=False):
@@ -118,7 +119,7 @@ def compute_buffers(y, beat_frames):
     return buffers
 
 
-def normalize(jumps, threshold, prefer_start, prefer_middle, avoid_end, language_tokens=None, prefer_words=False, no_language=False):
+def normalize(jumps, threshold, prefer_start, prefer_middle, avoid_end, buffer_language_tokens=None, prefer_words=False, no_language=False):
     n = len(jumps)
 
     logging.debug('Enhancing diagonals...')
@@ -155,11 +156,11 @@ def normalize(jumps, threshold, prefer_start, prefer_middle, avoid_end, language
     logging.debug('Adjusted jumps based on song position preferences.')
 
     # prefer or avoid chunks with language tokens
-    if language_tokens is not None:
+    if buffer_language_tokens is not None:
         for i in range(n):
-            if language_tokens[i]:
+            if buffer_language_tokens[i]:
                 jumps[i] *= 1.5 if prefer_words else 0.5
-            if no_language and language_tokens[i]:
+            if no_language and buffer_language_tokens[i]:
                 jumps[i] = 0
         logging.debug('Adjusted jumps based on language tokens.')
 
@@ -175,7 +176,7 @@ def get_next_position(i, jumps):
     return i + 1
 
 
-def save_to_files(buffers, sample_rate, jumps, output_dir, num_songs, min_length, max_length, language_tokens=None):
+def save_to_files(buffers, sample_rate, jumps, output_dir, num_songs, min_length, max_length, buffer_language_tokens=None):
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
         logging.info(f'Created output directory {output_dir}')
@@ -201,6 +202,9 @@ def save_to_files(buffers, sample_rate, jumps, output_dir, num_songs, min_length
         if min_length and song_length < min_length:
             logging.warning(f'Song {song_num} is shorter than the minimum length of {min_length} seconds.')
         else:
+            # Ensure the final window of the song cannot be in the middle of the remix
+            if song_buffers[-1] is not buffers[-1]:
+                song_buffers.append(buffers[-1])
             song_filename = os.path.join(output_dir, f'song_{song_num}.wav')
             sf.write(song_filename, numpy.concatenate(song_buffers), sample_rate)
             logging.info(f'Saved song {song_num} to {song_filename}')
@@ -237,53 +241,38 @@ def parse_args():
         '--no_language', action='store_true', help='Do not use any segments with detected language.')
     parser.add_argument(
         '--device', type=str, default=None, help='Torch device to use for Whisper (e.g., "cpu", "cuda").')
+    parser.add_argument(
+        '--list_language_sections', action='store_true', help='List detected language sections without generating files.')
+    parser.add_argument(
+        '--dry_run', action='store_true', help='Run the process without saving any files.')
+    parser.add_argument(
+        '--no_post_language_detection_processing', action='store_true', help='Skip post language detection processing.')
     return parser.parse_args()
 
 
-def detect_language_tokens(y, sample_rate, lang='en', device=None):
+def detect_language_tokens(filename, buffers, sample_rate, device=None):
     logging.info("Using internal Whisper library for language detection.")
-    model = whisper.load_model("base")
-    if device:
-        model = model.to(device)
-    else:
-        if torch.cuda.is_available():
-            model = model.to('cuda')
-        else:
-            model = model.to('cpu')
-
-    # load audio and pad/trim it to fit 30 seconds
-    audio = whisper.pad_or_trim(y)
-    # make log-Mel spectrogram and move to the same device as the model
-    mel = whisper.log_mel_spectrogram(audio).to(model.device)
-
-    # detect the spoken language
-    _, probs = model.detect_language(mel)
-    logging.info(f"Detected language: {max(probs, key=probs.get)}")
-
-    # decode the audio
-    options = whisper.DecodingOptions()
-    result = whisper.decode(model, mel, options)
-
+    model = whisper.load_model("large", device=device)
+    result = model.transcribe(
+        filename,
+    )
+    logging.info("Audio transcription complete.")
+    
     # create language tokens array
-    language_tokens = [False] * len(y)
-    for segment in result['segments']:
+    buffer_language_tokens = [False] * len(buffers)
+    for segment in tqdm(result['segments'], desc="Processing segments"):
         start = int(segment['start'] * sample_rate)
         end = int(segment['end'] * sample_rate)
-        for i in range(start, min(end, len(language_tokens))):
-            language_tokens[i] = True
+        for i, (buffer_start, buffer_end) in enumerate(iter_beat_slices(numpy.zeros(len(buffers)), range(len(buffers)))):
+            if buffer_start <= start < buffer_end or buffer_start < end <= buffer_end:
+                buffer_language_tokens[i] = True
+                logging.debug(f'Language detected in buffer {i} from {buffer_start} to {buffer_end}')
+    return buffer_language_tokens
 
-    return language_tokens
-
-
-def detect_language_in_buffers(buffers, sample_rate, lang='en', device=None):
-    language_tokens = []
-    merged_buffers = [numpy.concatenate(buffers[i:i+10]) for i in range(0, len(buffers), 10)]
-    for idx, buffer in tqdm(enumerate(merged_buffers), desc="Detecting language in buffers", total=len(merged_buffers)):
-        logging.info(f"Processing merged buffer {idx + 1}/{len(merged_buffers)}")
-        tokens = detect_language_tokens(buffer, sample_rate, lang, device)
-        language_tokens.extend([any(tokens)] * 10)
-        logging.info(f"Processed merged buffer {idx + 1}/{len(merged_buffers)}: Detected text: {tokens}")
-    return language_tokens[:len(buffers)]
+def list_language_sections(buffer_language_tokens):
+    for i, has_language in enumerate(buffer_language_tokens):
+        if has_language:
+            print(f'Buffer {i} contains language.')
 
 def main():
     logging.basicConfig(level=logging.DEBUG)
@@ -293,23 +282,30 @@ def main():
     y, sample_rate, beat_frames, jumps = load(args.filename, args.force)
 
     buffers = compute_buffers(y, beat_frames)
-    language_tokens = None
+    buffer_language_tokens = None
     if args.use_whisper and WHISPER_AVAILABLE:
-        logging.info('Detecting language tokens in buffers using Whisper...')
+        logging.info('Detecting language tokens in the input song using Whisper...')
         try:
-            language_tokens = detect_language_in_buffers(buffers, sample_rate, args.whisper_lang, args.device)
+            buffer_language_tokens = detect_language_tokens(args.filename, buffers, sample_rate, args.device)
         except KeyboardInterrupt:
             logging.error('Language detection interrupted by user.')
             return
 
-    jumps = normalize(jumps, args.threshold, args.prefer_start, args.prefer_middle, args.avoid_end, language_tokens, args.prefer_words, args.no_language)
-    jump_count = sum(sum(jumps > 0))
+    if args.list_language_sections and buffer_language_tokens is not None:
+        list_language_sections(buffer_language_tokens)
+        return
 
-    logging.info('Detected %d jump opportunities on %d beats', jump_count, len(buffers))
+    if not args.no_post_language_detection_processing:
+        jumps = normalize(jumps, args.threshold, args.prefer_start, args.prefer_middle, args.avoid_end, buffer_language_tokens, args.prefer_words, args.no_language)
+        jump_count = sum(sum(jumps > 0))
 
-    logging.info('Saving to files…')
-    save_to_files(buffers, sample_rate, jumps, args.output_dir, args.num_songs, args.min_length, args.max_length, language_tokens)
+        logging.info('Detected %d jump opportunities on %d beats', jump_count, len(buffers))
+
+    if not args.dry_run:
+        logging.info('Saving to files…')
+        save_to_files(buffers, sample_rate, jumps, args.output_dir, args.num_songs, args.min_length, args.max_length, buffer_language_tokens)
 
 
 if __name__ == '__main__':
     main()
+
