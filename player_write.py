@@ -81,7 +81,7 @@ def load(filename, force=False):
         with gzip.open(fn_inf, 'rb') as fh:
             beat_frames, jumps = pickle.load(fh)
     else:
-        logging.info('Analyzing…')
+        print('Analyzing…')
         y1, sample_rate1 = librosa.load(filename)
         tempo, beat_frames = librosa.beat.beat_track(y=y1, sr=sample_rate1)
         jumps = analyze(y1, sample_rate1, beat_frames)
@@ -143,20 +143,25 @@ def save_to_files(buffers, sample_rate, jumps, output_dir, num_songs, min_length
         i = 0
         n = len(buffers)
         song_length = 0
+        song_buffers = []
 
         while True:
-            filename = os.path.join(output_dir, f'song_{song_num}_buffer_{i}.wav')
-            sf.write(filename, buffers[i], sample_rate)
+            song_buffers.append(buffers[i])
             print_progress(i, n)
 
-            i = get_next_position(i, jumps)
             song_length += len(buffers[i]) / sample_rate
+            i = get_next_position(i, jumps)
+            if i >= n:
+                i = 0
 
-            if i >= n or (max_length and song_length >= max_length):
+            if max_length and song_length >= max_length:
                 break
 
         if min_length and song_length < min_length:
             logging.warning(f'Song {song_num} is shorter than the minimum length of {min_length} seconds.')
+        else:
+            song_filename = os.path.join(output_dir, f'song_{song_num}.wav')
+            sf.write(song_filename, numpy.concatenate(song_buffers), sample_rate)
 
 
 def parse_args():
